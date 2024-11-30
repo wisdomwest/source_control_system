@@ -54,6 +54,21 @@ Example:
 $ ./your_program.sh init 
 $ ./your_program.sh cat-file -p 256150983730c7b296403e4ee466cd885c6c56a9
 ```
+## hash-object Command
+
+The process includes:
+
+Reading the file content.
+Computing the SHA-1 hash of the file.
+Storing the file in .git/objects using a specific format.
+Zlib compression of the content before storage.
+The hash-object command can be used as follows:
+
+```
+$ ./your_program.sh hash-object -w <file_path>
+```
+
+The program should read the content of the file, compute the SHA-1 hash, and store the file in the .git/objects directory. The output should be the SHA-1 hash of the file.
 
 ## How to Use
 
