@@ -165,57 +165,78 @@ def read_gitignore():
         pass
     return ignored_files
 
-def write_tree(directory="."):
+def is_ignored(path, ignored_files):
+    """
+    Determines if a file path matches any pattern in .gitignore.
+    """
+    for pattern in ignored_files:
+        if pattern in path:
+            return True
+    return False
+
+def stage(files, staging_area):
+    """
+    Stages files by hashing their content and storing them in the staging area.
+    
+    Args:
+        files (list): List of file paths to stage.
+        staging_area (dict): Dictionary representing the staging area.
+    """
+    ignored_files = read_gitignore()
+
+    for file in files:
+        if os.path.exists(file):
+            # Skip ignored files
+            if is_ignored(file, ignored_files):
+                print(f"Ignoring {file} (matched .gitignore)")
+                continue
+            
+            # Hash the file content
+            if os.path.isfile(file):
+                sha = hash_object(file)
+                staging_area[file] = sha
+                print(f"Staged: {file} -> {sha}")
+            else:
+                print(f"Skipping {file} (not a file)")
+        else:
+            print(f"File {file} does not exist.")
+
+    return staging_area
+
+def write_tree(directory=".", staging_area=None):
+    """
+    Recursively writes the directory's structure as a tree object.
+    Uses staged files and .gitignore rules.
+    """
     entries = []
     ignored_files = read_gitignore()
-    
+
+    # If no staging area is provided, use an empty dictionary
+    if staging_area is None:
+        staging_area = {}
+
     for entry in sorted(os.listdir(directory)):
-        # Skip files in .gitignore
-        if entry in ignored_files or entry == ".git":
+        # Skip ignored files and .git directory
+        if entry == ".git" or is_ignored(entry, ignored_files):
             continue
 
         entry_path = os.path.join(directory, entry)
         if os.path.isfile(entry_path):
-            # Create a blob object for the file
-            with open(entry_path, "rb") as f:
-                blob_data = f.read()
-            blob_sha = hash_object_tree(blob_data, obj_type="blob")
+            # Use staged content if available
+            if entry_path in staging_area:
+                blob_sha = staging_area[entry_path]
+            else:
+                # Hash and stage the file content
+                with open(entry_path, "rb") as f:
+                    blob_data = f.read()
+                blob_sha = hash_object_tree(blob_data, obj_type="blob")
+                staging_area[entry_path] = blob_sha  # Stage the file
+
             mode = "100644"  # Regular file mode
             entries.append((mode, entry, blob_sha))
         elif os.path.isdir(entry_path):
-            # Recursively create a tree object for the directory
-            tree_sha = write_tree(entry_path)
-            mode = "40000"  # Directory mode
-            entries.append((mode, entry, tree_sha))
-
-    # Construct the tree data
-    tree_data = b""
-    for mode, name, sha in entries:
-        tree_data += f"{mode} {name}\0".encode() + bytes.fromhex(sha)
-
-    # Create and return the SHA of the tree object
-    return hash_object_tree(tree_data, obj_type="tree")
-
-    """
-    Recursively create tree objects for the current directory.
-    """
-    entries = []
-    for entry in sorted(os.listdir(directory)):
-        # Ignore the .git directory
-        if entry == ".git":
-            continue
-
-        entry_path = os.path.join(directory, entry)
-        if os.path.isfile(entry_path):
-            # Create a blob object for the file
-            with open(entry_path, "rb") as f:
-                blob_data = f.read()
-            blob_sha = hash_object_tree(blob_data, obj_type="blob")
-            mode = "100644"  # Regular file mode
-            entries.append((mode, entry, blob_sha))
-        elif os.path.isdir(entry_path):
-            # Recursively create a tree object for the directory
-            tree_sha = write_tree(entry_path)
+            # Recursively write the directory as a tree object
+            tree_sha = write_tree(entry_path, staging_area)
             mode = "40000"  # Directory mode
             entries.append((mode, entry, tree_sha))
 
@@ -366,6 +387,23 @@ def create_branch(branch_name, start_commit_sha):
     
     with open(branch_path, "w") as f:
         f.write(start_commit_sha)
+        
+def get_tree_entries(tree_sha):
+    """
+    Retrieve the entries from a tree object.
+    """
+    tree_data = get_object_content(tree_sha)
+    entries = []
+
+    # A tree object is a list of <mode> <sha> <file_name>
+    lines = tree_data.split(b'\n')
+    for line in lines:
+        parts = line.split(b' ')
+        if len(parts) == 3:
+            entry = {'mode': parts[0], 'sha': parts[1], 'name': parts[2].decode()}
+            entries.append(entry)
+    
+    return entries
 
 def compare_trees(tree_sha1, tree_sha2):
     """
@@ -392,6 +430,48 @@ def compare_trees(tree_sha1, tree_sha2):
             diff.append(f"File {file_name} exists only in tree2")
 
     return diff
+
+def create_object(object_type, data):
+    """
+    Create an object of the given type and return its SHA.
+    This function will:
+    - Compress the object data using zlib.
+    - Store the compressed data in the .git/objects directory.
+    - Return the SHA-1 hash of the object.
+    """
+    # Create the object data (including the type and length prefix)
+    object_data = f"{object_type} {len(data)}\0".encode() + data
+
+    # Compress the object data using zlib
+    compressed_data = zlib.compress(object_data)
+
+    # Calculate the SHA-1 hash of the compressed data
+    object_sha = hashlib.sha1(compressed_data).hexdigest()
+
+    # Get the directory and file path where the object will be stored
+    obj_dir = f".git/objects/{object_sha[:2]}"
+    obj_file = f"{obj_dir}/{object_sha[2:]}"
+
+    # Create the directory if it doesn't exist
+    os.makedirs(obj_dir, exist_ok=True)
+
+    # Write the compressed data to the object file
+    with open(obj_file, "wb") as f:
+        f.write(compressed_data)
+
+    # Return the SHA of the created object
+    return object_sha
+
+def create_tree_object(entries):
+    """
+    Create a new tree object and return its SHA.
+    """
+    tree_data = b''
+    for entry in entries:
+        tree_data += f"{entry['mode']} {entry['sha']} {entry['name']}".encode() + b'\n'
+
+    # Create the tree object and return its SHA
+    return create_object("tree", tree_data)
 
 def merge_trees(target_tree, source_tree):
     """
@@ -529,6 +609,13 @@ def main():
         source_dir = sys.argv[2]
         destination_dir = sys.argv[3]
         clone_repository(source_dir, destination_dir)
+    elif command == "stage":
+        if len(sys.argv) < 3:
+            raise RuntimeError("Usage: stage <file1> [<file2> ...]")
+        # Stage the specified files
+        files = sys.argv[2:]
+        staging_area = {}
+        stage(files, staging_area)
     else:
         raise RuntimeError(f"Unknown command #{command}")
 
