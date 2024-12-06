@@ -71,6 +71,7 @@ def hash_object(file_path):
 
     # Output the hash to stdout
     print(sha1_hash)
+    return sha1_hash
 
 def hash_object_tree(data, obj_type="blob"):
     """
@@ -174,14 +175,21 @@ def is_ignored(path, ignored_files):
             return True
     return False
 
-def stage(files, staging_area):
+def update_index(file, sha, index_path=".git/index"):
     """
-    Stages files by hashing their content and storing them in the staging area.
-    
-    Args:
-        files (list): List of file paths to stage.
-        staging_area (dict): Dictionary representing the staging area.
+    Updates the .git/index file to record a staged file.
     """
+    with open(index_path, "a") as index_file:
+        timestamp = int(time.time())
+        index_entry = f"{sha} {file} {timestamp}\n"
+        index_file.write(index_entry)
+
+def stage(files):
+    """
+    Stages files by hashing their content, storing them in the .git/objects directory,
+    and updating the .git/index file.
+    """
+    staging_area = {}
     ignored_files = read_gitignore()
 
     for file in files:
@@ -190,11 +198,12 @@ def stage(files, staging_area):
             if is_ignored(file, ignored_files):
                 print(f"Ignoring {file} (matched .gitignore)")
                 continue
-            
+
             # Hash the file content
             if os.path.isfile(file):
                 sha = hash_object(file)
                 staging_area[file] = sha
+                update_index(file, sha)
                 print(f"Staged: {file} -> {sha}")
             else:
                 print(f"Skipping {file} (not a file)")
@@ -260,18 +269,22 @@ def create_commit_object(tree_sha, parent_sha, message, branch_name="main"):
     content = f"tree {tree_sha}\n"
     if parent_sha and parent_sha != "0" * 40:  # Validate parent SHA
         content += f"parent {parent_sha}\n"
-    content += f"""author {author} {timestamp} {timezone_offset}
-committer {author} {timestamp} {timezone_offset}
+    content += (
+        f"author {author} {timestamp} {timezone_offset}\n"
+        f"committer {author} {timestamp} {timezone_offset}\n\n"
+        f"{message}\n"  # Commit message
+    )
 
-{message}\n"""
-
-
-    # Encode the complete content as bytes
-    content = content.encode()
-
+    try:
+        content_bytes = content.encode('utf-8')
+    except UnicodeEncodeError as e:
+        print(f"Encoding error: {e}")
+        print("Problematic content:", content)
+        raise
+    
     # Compute the SHA-1 hash of the commit object
-    header = f"commit {len(content)}\0".encode()
-    commit_data = header + content
+    header = f"commit {len(content_bytes)}\0".encode('utf-8')
+    commit_data = header + content_bytes
     sha1_hash = hashlib.sha1(commit_data).hexdigest()
 
     # Save the commit object
@@ -281,13 +294,13 @@ committer {author} {timestamp} {timezone_offset}
     if not os.path.exists(object_file):
         with open(object_file, "wb") as f:
             f.write(zlib.compress(commit_data))
-    
+
     # Update the branch reference
-    with open(f".git/refs/heads/{branch_name}", "w") as f:
+    branch_file = f".git/refs/heads/{branch_name}"
+    with open(branch_file, "w") as f:
         f.write(sha1_hash)
     
     return sha1_hash
-
 
 def get_commit_sha(branch_name):
     """
@@ -298,7 +311,38 @@ def get_commit_sha(branch_name):
             return f.read().strip()
     except FileNotFoundError:
         raise RuntimeError(f"Branch '{branch_name}' does not exist.")
-    
+
+def get_parent_sha_from_head():
+    """
+    Retrieves the parent commit SHA by reading from HEAD.
+    It extracts the SHA of the current commit, then fetches its parent SHA.
+    """
+    head_path = ".git/HEAD"
+
+    if not os.path.exists(head_path):
+        raise RuntimeError("No HEAD reference found. Are you in a Git repository?")
+
+    # Read the HEAD reference to get the current commit or branch
+    with open(head_path, "r") as f:
+        head_content = f.read().strip()
+
+    if head_content.startswith("ref:"):
+        # If HEAD is pointing to a branch (e.g., ref: refs/heads/main)
+        branch_name = head_content.split(" ")[1]
+        branch_path = f".git/{branch_name}"
+
+        if not os.path.exists(branch_path):
+            raise RuntimeError(f"Branch '{branch_name}' does not exist.")
+
+        # Read the commit SHA from the branch reference
+        with open(branch_path, "r") as branch_file:
+            commit_sha = branch_file.read().strip()
+    else:
+        # HEAD is pointing to a commit directly (detached HEAD state)
+        commit_sha = head_content
+        
+    print(f"HEAD is at commit: {commit_sha}")
+
 def get_parent_commit_sha(commit_data):
     """
     Extract the parent commit SHA from commit data.
@@ -513,6 +557,67 @@ def merge_branches(target_branch, source_branch):
         merged_tree = merge_trees(target_tree, source_tree)
         new_commit_sha = create_commit_object(merged_tree, target_commit, "Merged changes.")
         print(f"Merged commit: {new_commit_sha}")
+        
+def checkout(branch_name):
+    """
+    Switches to the specified branch by updating HEAD and the working directory.
+    """
+    branch_path = f".git/refs/heads/{branch_name}"
+
+    # Check if the branch exists
+    if not os.path.exists(branch_path):
+        raise RuntimeError(f"Branch '{branch_name}' does not exist.")
+
+    # Update HEAD to point to the new branch
+    with open(".git/HEAD", "w") as f:
+        f.write(f"ref: refs/heads/{branch_name}\n")
+
+    # Get the commit SHA of the branch
+    with open(branch_path, "r") as f:
+        commit_sha = f.read().strip()
+
+    print(f"Switched to branch '{branch_name}'")
+
+    # Reset the working directory to match the branch
+    reset_to_commit(commit_sha)
+
+
+def reset_to_commit(commit_sha):
+    """
+    Resets the working directory to match the state of the specified commit.
+    """
+    # Get the tree SHA from the commit
+    tree_sha = get_commit_tree(commit_sha)
+
+    # Clear the working directory (except for .git)
+    for entry in os.listdir("."):
+        if entry != ".git":
+            if os.path.isfile(entry):
+                os.remove(entry)
+            elif os.path.isdir(entry):
+                shutil.rmtree(entry)
+
+    # Restore the working directory from the tree object
+    restore_tree(tree_sha)
+
+def restore_tree(tree_sha, current_dir="."):
+    """
+    Recursively restores the working directory from a tree object.
+    """
+    entries = parse_tree_object(tree_sha)
+
+    for mode, name, sha in entries:
+        path = os.path.join(current_dir, name)
+
+        if mode == "40000":  # Directory
+            os.makedirs(path, exist_ok=True)
+            restore_tree(sha, current_dir=path)
+        elif mode == "100644":  # Regular file
+            # Retrieve the blob content and write it to the file
+            content = get_blob_content(sha)
+            with open(path, "w") as f:
+                f.write(content)
+
 
 def diff_commits(commit_sha1, commit_sha2):
     tree1 = get_commit_tree(commit_sha1)
@@ -560,13 +665,14 @@ def main():
         tree_sha = write_tree()
         print(tree_sha)
     elif command == "commit-tree":
-        if len(sys.argv) < 7 or sys.argv[3] != "-p" or sys.argv[5][:2] != "-m":
+        if len(sys.argv) < 7 or sys.argv[3] != "-p" or sys.argv[5] != "-m":
             raise RuntimeError("Usage: commit-tree <tree_sha> -p <parent_sha> -m <message>")
-        
+
         tree_sha = sys.argv[2]
         parent_sha = sys.argv[4]
-        message = sys.argv[5][3:]
-        
+        message = sys.argv[6]  # Corrected to grab the next argument
+        print(message)
+
         # Default branch name
         branch_name = "main"
 
@@ -614,8 +720,16 @@ def main():
             raise RuntimeError("Usage: stage <file1> [<file2> ...]")
         # Stage the specified files
         files = sys.argv[2:]
-        staging_area = {}
-        stage(files, staging_area)
+        stage(files)
+    elif command == "checkout":
+        if len(sys.argv) < 3:
+            raise RuntimeError("Usage: checkout <branch_name>")
+        # Checkout to the specified branch (e.g., "main")
+        branch_name = sys.argv[2]
+        checkout(branch_name)
+    elif command == "parent":
+        parent_sha = get_parent_sha_from_head()
+        print(f"Parent commit SHA: {parent_sha if parent_sha else 'None'}")
     else:
         raise RuntimeError(f"Unknown command #{command}")
 
