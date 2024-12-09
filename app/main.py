@@ -4,6 +4,9 @@ import zlib
 import hashlib
 import time
 import shutil
+import re
+import chardet
+
 
 def initialize_git_repo():
     # Create necessary directories
@@ -19,6 +22,9 @@ def initialize_git_repo():
         f.write('ref: refs/heads/main\n')
 
 def get_blob_content(blob_sha):
+    """
+    Retrieve the content of a blob object from the .git/objects directory.
+    """
     # Construct the file path for the blob object
     blob_dir = f".git/objects/{blob_sha[:2]}"
     blob_file = f"{blob_dir}/{blob_sha[2:]}"
@@ -40,8 +46,26 @@ def get_blob_content(blob_sha):
     if blob_type != b"blob":
         raise RuntimeError(f"Unexpected object type: {blob_type.decode()}")
 
-    # Return the file content as a string
-    return content.decode()
+    # Check if the content is binary by looking for non-printable characters
+    if is_binary_content(content):
+        print(f"Blob {blob_sha} is binary. Returning raw binary content.")
+        return content  # Return binary content as-is
+    else:
+        try:
+            return content.decode('utf-8')
+        except UnicodeDecodeError:
+            print(f"Blob {blob_sha} could not be decoded as UTF-8. Returning raw binary content.")
+            return content  # Return binary content as-is
+
+def is_binary_content(content):
+    """
+    Check if the content contains binary data.
+    Returns True if the content is binary, False if it's text.
+    """
+    # Check for the presence of binary characters in the first 8000 bytes
+    text_characters = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x100)) - {0x7f})
+    # If any character is not in the text_characters set, treat as binary
+    return bool(content.translate(None, text_characters))
 
 def hash_object(file_path):
     # Read the file's content
@@ -112,6 +136,41 @@ def get_object_content(object_sha):
 
     decompressed_data = zlib.decompress(compressed_data)
     return decompressed_data
+
+def parse_commit(commit_sha):
+    """
+    Parse a commit object to extract the tree SHA and return tree entries.
+    
+    Args:
+        commit_sha (str): The SHA of the commit object.
+    
+    Returns:
+        list: A list of tree entries (mode, name, sha) for the commit's tree object.
+    """
+    # Get the raw content of the commit object
+    content = get_object_content(commit_sha)
+    
+    # Split header and data
+    header, commit_data = content.split(b'\0', 1)
+    object_type, size = header.split(b' ', 1)
+
+    if object_type == b"commit":
+        # Parse tree SHA for commit
+        tree_match = re.search(r'\b(tree [0-9a-f]{40})\b', commit_data.decode())
+        if tree_match:
+            tree_sha = tree_match.group(1).split()[1]
+        else:
+            raise RuntimeError(f"No tree SHA found in commit data for SHA {commit_sha}")
+        
+        # Return the entries from the tree object using parse_tree_object
+        return parse_tree_object(tree_sha)
+    
+    elif object_type == b"tree":
+        # If it's a tree, directly parse it using parse_tree_object
+        return parse_tree_object(commit_sha)
+    
+    else:
+        raise RuntimeError(f"Unexpected object type: {object_type.decode()}")
 
 def parse_tree_object(tree_sha):
     # Get the raw content of the tree object
@@ -358,18 +417,57 @@ def get_commit_tree(commit_sha):
     """
     Retrieve the tree SHA from a commit object.
     """
+    if not isinstance(commit_sha, str):
+        raise TypeError(f"Expected commit_sha to be a string, got {type(commit_sha)}")
+
+    if not (len(commit_sha) == 40 and all(c in "0123456789abcdef" for c in commit_sha)):
+        raise ValueError(f"Invalid SHA format: {commit_sha}. Must be a 40-character hexadecimal string.")
+
     commit_data = get_object_content(commit_sha)
-    
-    # Attempt to decode only if the content is text (i.e., it's not binary)
+
+    # Inspect raw commit data as bytes before decoding
+    print(f"Raw commit data for {commit_sha} (first 100 bytes): {commit_data[:100]}")
+
+    # Try to decode commit data with fallback
     try:
-        commit_data = commit_data.decode()
-    except UnicodeDecodeError:
-        raise RuntimeError(f"Commit data for SHA {commit_sha} is not valid UTF-8.")
+        commit_data = safe_decode(commit_data)
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"Failed to decode commit data for SHA {commit_sha}: {e}")
     
-    lines = commit_data.split("\n")
-    if lines and lines[0].startswith("tree "):
-        return lines[0].split()[1]
-    raise RuntimeError(f"Invalid commit format for SHA {commit_sha}")
+    print(f"Decoded commit data for {commit_sha} (first 200 chars):\n{commit_data[:200]}")
+
+    # Adjust the regex to capture potential garbage or additional characters
+    match = re.search(r'\b(tree [0-9a-f]{40})\b', commit_data)
+    if match:
+        tree_sha = match.group(1).split()[1]
+        print(f"Found tree SHA for {commit_sha}: {tree_sha}")
+
+        if not (len(tree_sha) == 40 and all(c in "0123456789abcdef" for c in tree_sha)):
+            raise RuntimeError(f"Invalid tree SHA found in commit data: {tree_sha}")
+        
+        return tree_sha
+
+    raise RuntimeError(f"Invalid commit format for SHA {commit_sha}. No 'tree' entry found.")
+
+def safe_decode(data):
+    """
+    Try to decode data safely. If decoding fails, fallback to ignoring invalid bytes.
+    """
+    # First, try using chardet to detect the encoding
+    detected = chardet.detect(data)
+    encoding = detected['encoding']
+    if encoding:
+        try:
+            # Decode using the detected encoding
+            return data.decode(encoding)
+        except (UnicodeDecodeError, TypeError):
+            pass
+    
+    # Fallback: try to decode using UTF-8 and ignore invalid characters
+    try:
+        return data.decode('utf-8', errors='ignore')
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"Failed to decode data with fallback: {e}")
 
 def show_commit_history(branch_name="main"):
     """
@@ -454,8 +552,8 @@ def compare_trees(tree_sha1, tree_sha2):
     Compare two tree objects and return a diff or conflict report.
     """
     # Parse the tree objects and get their entries
-    entries1 = parse_tree_object(tree_sha1)
-    entries2 = parse_tree_object(tree_sha2)
+    entries1 = parse_commit(tree_sha1)
+    entries2 = parse_commit(tree_sha2)
 
     diff = []
     # Create dictionaries using filenames as keys for easy comparison
@@ -560,7 +658,7 @@ def merge_branches(target_branch, source_branch):
         
 def checkout(branch_name):
     """
-    Switches to the specified branch by updating HEAD and the working directory.
+    Switches to the specified branch by updating HEAD and the working directory. 
     """
     branch_path = f".git/refs/heads/{branch_name}"
 
@@ -581,55 +679,160 @@ def checkout(branch_name):
     # Reset the working directory to match the branch
     reset_to_commit(commit_sha)
 
-
-def reset_to_commit(commit_sha):
+def get_branch_commit_hash(branch_name):
     """
-    Resets the working directory to match the state of the specified commit.
+    Retrieve the commit hash for the latest commit in a given branch.
+    This function assumes that the branch names exist in the .git/refs/heads directory.
     """
-    # Get the tree SHA from the commit
-    tree_sha = get_commit_tree(commit_sha)
+    branch_ref_path = os.path.join('.git', 'refs', 'heads', branch_name)
+    
+    # Check if the branch exists
+    if not os.path.exists(branch_ref_path):
+        raise ValueError(f"Branch '{branch_name}' not found.")
+    
+    with open(branch_ref_path, 'r') as f:
+        return f.read().strip()
 
-    # Clear the working directory (except for .git)
-    for entry in os.listdir("."):
-        if entry != ".git":
-            if os.path.isfile(entry):
-                os.remove(entry)
-            elif os.path.isdir(entry):
-                shutil.rmtree(entry)
-
-    # Restore the working directory from the tree object
-    restore_tree(tree_sha)
-
-def restore_tree(tree_sha, current_dir="."):
+def diff_commits(branch1, branch2):
     """
-    Recursively restores the working directory from a tree object.
+    Show the diff between the latest commits of two branches.
     """
-    entries = parse_tree_object(tree_sha)
+    # Get the latest commit hashes for the two branches
+    commit_sha1 = get_branch_commit_hash(branch1)
+    commit_sha2 = get_branch_commit_hash(branch2)
 
-    for mode, name, sha in entries:
-        path = os.path.join(current_dir, name)
-
-        if mode == "40000":  # Directory
-            os.makedirs(path, exist_ok=True)
-            restore_tree(sha, current_dir=path)
-        elif mode == "100644":  # Regular file
-            # Retrieve the blob content and write it to the file
-            content = get_blob_content(sha)
-            with open(path, "w") as f:
-                f.write(content)
-
-
-def diff_commits(commit_sha1, commit_sha2):
+    # Fetch the tree for each commit
     tree1 = get_commit_tree(commit_sha1)
     tree2 = get_commit_tree(commit_sha2)
     
+    # Compare the trees and display the diff
     diff = compare_trees(tree1, tree2)
+    print(f"Diff between {branch1} and {branch2}:")
     print(diff)
 
-def clone_repository(source_dir, destination_dir):
-    shutil.copytree(source_dir + "/.git", destination_dir + "/.git")
-    print(f"Cloned repository from {source_dir} to {destination_dir}")
+def restore_object_content(object_sha):
+    """
+    Retrieve the content of any Git object (commit, tree, or blob).
+    """
+    if isinstance(object_sha, bytes):
+        object_sha = object_sha.decode()  # Ensure it's a string, not bytes
+
+    # Validate the object SHA format
+    if len(object_sha) != 40 or not all(c in "0123456789abcdef" for c in object_sha):
+        raise ValueError(f"Invalid SHA format: {object_sha}")
+
+    # Fetch the object content using the get_object_content function
+    content = get_object_content(object_sha)
+
+    # Check if the object is a tree or a commit
+    if content.startswith(b"tree"):
+        # Parse the tree object (no author data here)
+        entries = parse_tree_object(object_sha)
+        return "tree", entries
+    elif content.startswith(b"commit"):
+        # Parse the commit object to get the tree SHA
+        lines = content.split(b'\0')
+        tree_line = lines[1]  # The second line contains the tree SHA
+        tree_sha = tree_line.split(b' ')[1].decode()  # Extract tree SHA
+        return "commit", tree_sha  # Return the tree SHA for restoring
+    else:
+        # Handle other types, such as blob
+        raise RuntimeError(f"Unsupported object type for {object_sha}")
+
+def restore_tree(tree_sha, current_dir=""):
+    """
+    Recursively restore the files and directories from a tree object (from .git/objects).
+    """
+    # Retrieve the tree object content
+    object_type, tree_content = restore_object_content(tree_sha)
+
+    if object_type != "tree":
+        raise RuntimeError(f"Unexpected object type: {object_type}. Expected 'tree'.")
+
+    # Continue with existing tree restoration logic
+    for mode, file_name, sha in tree_content:
+        file_name_decoded = file_name.decode(errors='surrogateescape') if isinstance(file_name, bytes) else file_name
+        file_path = os.path.join(current_dir, file_name_decoded)
+
+        if mode.startswith('4'):  # Directory mode
+            print(f"Restoring directory {file_path}")
+            restore_tree(sha, current_dir=file_path)  # Recursive call for directories
+        else:  # File mode (blob)
+            print(f"Restoring file {file_path}")
+            
+            # Fetch the raw content of the blob (file)
+            content = get_blob_content(sha)  # Get the raw content, either binary or text
+
+            # Now that you have the content (binary or text), restore it to a file
+            restore_file(content, file_path)
+
+
+def restore_file(content, file_path):
+    """
+    Restores a file's content to disk (writes it).
+    If content is binary, it writes as binary, otherwise as text.
+    """
+    mode = 'wb' if isinstance(content, bytes) else 'w'
     
+    with open(file_path, mode) as f:
+        f.write(content)
+
+    print(f"File restored at: {file_path}")
+
+def reset_to_commit(commit_sha):
+    """
+    Reset the working directory to match the state of the repository at the given commit.
+    This will recursively restore the files and directories from the commit's tree object.
+    """
+    # Get the raw content of the commit object
+    object_type, commit_content = restore_object_content(commit_sha)
+
+    if object_type != "commit":
+        raise RuntimeError(f"Unexpected object type: {object_type}. Expected 'commit'.")
+
+    # The commit content returns the tree SHA that we need to restore
+    tree_sha = commit_content  # This is the tree SHA returned by the restore_object_content function
+    print(f"Commit {commit_sha} points to tree {tree_sha}")
+    
+    # Cleaning the tree_sha in case the author line is present
+    tree_sha_cleaned = tree_sha.splitlines()[0]
+
+    print(f"Restoring tree {tree_sha_cleaned} to working directory")
+    restore_tree(tree_sha_cleaned)
+
+    # Step 2: If there are other details to reset (e.g., index files or other state), handle them here
+    # For simplicity, this example assumes the tree content is all we need.
+    print(f"Reset to commit {commit_sha} complete.")
+    
+def clone_repository(source_dir, destination_dir):
+    """
+    Clone the repository from source_dir to destination_dir.
+    This copies the .git directory and restores the working directory files.
+    """
+    # Step 1: Copy the .git directory
+    shutil.copytree(os.path.join(source_dir, ".git"), os.path.join(destination_dir, ".git"))
+    print(f"Cloned repository from {source_dir} to {destination_dir}")
+
+    # Step 2: Move into the destination directory and get the latest commit SHA from HEAD
+    head_path = os.path.join(destination_dir, ".git", "HEAD")
+    with open(head_path, "r") as f:
+        ref = f.read().strip()
+        
+    # If HEAD is in the format "ref: refs/heads/main", get the branch reference
+    if ref.startswith("ref:"):
+        ref_path = os.path.join(destination_dir, ".git", ref.split(" ")[1])
+        with open(ref_path, "r") as f:
+            commit_sha = f.read().strip()
+    else:
+        # If HEAD contains a SHA directly (detached HEAD), use it directly
+        commit_sha = ref
+
+    print(f"HEAD points to commit {commit_sha}")
+
+    # Step 3: Reset the working directory to match the commit
+    os.chdir(destination_dir)  # Change to the destination directory
+    reset_to_commit(commit_sha)
+
 def main():
     print("Logs from your program will appear here!", file=sys.stderr)
 
@@ -730,6 +933,12 @@ def main():
     elif command == "parent":
         parent_sha = get_parent_sha_from_head()
         print(f"Parent commit SHA: {parent_sha if parent_sha else 'None'}")
+    elif command == "diff":
+        if len(sys.argv) != 4:
+            raise RuntimeError("Usage: diff <branch> <branch>")
+        commit_sha1 = sys.argv[2]
+        commit_sha2 = sys.argv[3]
+        diff_commits(commit_sha1, commit_sha2)
     else:
         raise RuntimeError(f"Unknown command #{command}")
 
